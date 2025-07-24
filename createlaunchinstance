@@ -1,0 +1,252 @@
+#!/bin/bash
+
+set -e
+
+REGION="ap-southeast-2"
+LAUNCH_TEMPLATE_ID="lt-04ceb7a70df074f2a"
+
+LIVE_MODE=false
+INSTANCE_ID=""
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --live)
+            LIVE_MODE=true
+            shift
+            ;;
+        -*)
+            echo "Unknown option $1"
+            echo "Usage: $0 [--live] [instance-id]"
+            exit 1
+            ;;
+        *)
+            INSTANCE_ID="$1"
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$INSTANCE_ID" ]]; then
+    echo "Fetching EC2 instances..."
+    selection=$(
+        aws ec2 describe-instances \
+            --region "$REGION" \
+            --query "Reservations[*].Instances[*].[InstanceId,InstanceType,State.Name,Tags[?Key=='Name']|[0].Value,Placement.AvailabilityZone]" \
+            --output text | \
+        awk -F'\t' '{ printf "%s\t%s\t%s\t%s\t%s\n", $1, $2, $3, $4, $5 }' | \
+        fzf --prompt="Select EC2 instance to create image from: " \
+            --with-nth=1,2,5 \
+            --header="ID\tType\tAZ\tState\tName" \
+            --preview="echo -e \"Type:\t{2}\nState:\t{3}\nName:\t{4}\nAZ:\t{5}\"" \
+            --preview-window=down:4
+    )
+    
+    INSTANCE_ID=$(echo "$selection" | awk '{print $1}')
+    
+    if [[ -z "$INSTANCE_ID" ]]; then
+        echo "No instance selected."
+        exit 1
+    fi
+fi
+
+# Function to execute or show commands
+execute_command() {
+    local cmd="$1"
+    local description="$2"
+    
+    echo "[$description]"
+    echo "Command: $cmd"
+    
+    if [[ "$LIVE_MODE" == "true" ]]; then
+        read -p "Execute this command? (y/N): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            eval "$cmd"
+        else
+            echo "Skipped: $description"
+            return 1
+        fi
+    else
+        echo "DEBUG MODE: Command would be executed"
+        echo
+    fi
+}
+
+echo "Selected instance: $INSTANCE_ID"
+
+# Check for existing AMI creation in progress for this instance
+echo "Checking for existing AMI creation for this instance..."
+SKIP_CREATE=false
+if [[ "$LIVE_MODE" == "true" ]]; then
+    PENDING_IMAGES=$(aws ec2 describe-images \
+        --region "$REGION" \
+        --owners self \
+        --filters "Name=state,Values=pending" "Name=name,Values=Millstream-App-Server-*" \
+        --query "Images[].[Name,State,ImageId]" \
+        --output text)
+    
+    if [[ -n "$PENDING_IMAGES" ]]; then
+        echo "Found existing AMI creation in progress:"
+        echo "$PENDING_IMAGES" | while read name state image_id; do
+            echo "  - $name ($image_id) - $state"
+        done
+        
+        # Use the first pending image found  
+        IMAGE_ID=$(echo "$PENDING_IMAGES" | head -n1 | awk '{print $3}')
+        IMAGE_NAME=$(echo "$PENDING_IMAGES" | head -n1 | awk '{print $1}')
+        echo "DEBUG: Parsed IMAGE_ID='$IMAGE_ID', IMAGE_NAME='$IMAGE_NAME'"
+        echo "Using existing pending AMI: $IMAGE_ID ($IMAGE_NAME)"
+        SKIP_CREATE=true
+    else
+        echo "No pending AMI creation found."
+        IMAGE_NAME="Millstream-App-Server-$(TZ='Australia/Perth' date +"%F-%H-%M-%S")"
+        echo "Will create new image: $IMAGE_NAME"
+    fi
+else
+    echo "DEBUG: Would check for pending AMI creation"
+    IMAGE_NAME="Millstream-App-Server-$(TZ='Australia/Perth' date +"%F-%H-%M-%S")"
+    echo "Image name will be: $IMAGE_NAME"
+fi
+echo
+
+# Get current default version from AWS
+echo "Getting current default version from launch template..."
+if [[ "$LIVE_MODE" == "true" ]]; then
+    DEFAULT_VERSION=$(aws ec2 describe-launch-templates --region "$REGION" --launch-template-ids "$LAUNCH_TEMPLATE_ID" --query 'LaunchTemplates[0].DefaultVersionNumber' --output text)
+    echo "Current default version: $DEFAULT_VERSION"
+else
+    DEFAULT_VERSION="XX"
+    echo "DEBUG: Would fetch current default version (currently: $DEFAULT_VERSION)"
+fi
+echo
+
+if [[ "$LIVE_MODE" == "false" ]]; then
+    echo "=== DEBUG MODE - Commands that would be executed ==="
+    echo
+else
+    echo "=== LIVE MODE - Commands will be executed with confirmation ==="
+    echo
+fi
+
+# Step 1: Create AMI (skip if pending AMI exists)
+if [[ "$SKIP_CREATE" == "true" ]]; then
+    echo "[Create AMI from instance]"
+    echo "SKIPPED: Using existing pending AMI $IMAGE_ID"
+    echo
+else
+    CMD1="aws ec2 create-image --region \"$REGION\" --name \"$IMAGE_NAME\" --instance-id \"$INSTANCE_ID\" --output json"
+    echo "[Create AMI from instance]"
+    echo "Command: $CMD1"
+    
+    if [[ "$LIVE_MODE" == "true" ]]; then
+        read -p "Execute this command? (y/N): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            CREATE_IMAGE_OUTPUT=$(aws ec2 create-image --region "$REGION" --name "$IMAGE_NAME" --instance-id "$INSTANCE_ID" --output json)
+            IMAGE_ID=$(echo "$CREATE_IMAGE_OUTPUT" | jq -r '.ImageId')
+            echo "Created image: $IMAGE_ID"
+        else
+            echo "Skipped: Create AMI from instance"
+            exit 1
+        fi
+    else
+        echo "DEBUG MODE: Command would be executed"
+        IMAGE_ID="ami-xxxxxxxxx"
+        echo "DEBUG: Would create image with ID: $IMAGE_ID"
+    fi
+    echo
+fi
+
+# Step 2: Wait for image availability
+echo "[Wait for image to be available]"
+if [[ "$LIVE_MODE" == "true" ]]; then
+    echo "Waiting for AMI $IMAGE_ID to become available..."
+    echo "This may take several minutes. Checking every 15 seconds..."
+    
+    # Custom wait with progress
+    while true; do
+        STATE=$(aws ec2 describe-images --region "$REGION" --image-ids "$IMAGE_ID" --query 'Images[0].State' --output text 2>/dev/null)
+        if [[ "$STATE" == "available" ]]; then
+            echo "✓ AMI is now available!"
+            break
+        elif [[ "$STATE" == "failed" ]]; then
+            echo "✗ AMI creation failed!"
+            exit 1
+        else
+            echo "  Current state: $STATE (waiting...)"
+            sleep 15
+        fi
+    done
+else
+    echo "DEBUG MODE: Would wait for image to become available"
+fi
+echo
+
+# Step 3: Get launch template data
+echo "[Get current launch template data]"
+if [[ "$LIVE_MODE" == "true" ]]; then
+    echo "Getting launch template data from instance $INSTANCE_ID..."
+    LAUNCH_TEMPLATE_DATA=$(aws ec2 get-launch-template-data --region "$REGION" --query 'LaunchTemplateData' --instance-id "$INSTANCE_ID" --output json)
+    UPDATED_TEMPLATE_DATA=$(echo "$LAUNCH_TEMPLATE_DATA" | jq --arg image_id "$IMAGE_ID" '.ImageId = $image_id')
+    echo "✓ Launch template data retrieved and updated with new image ID"
+else
+    echo "DEBUG MODE: Would fetch and update launch template data with new image ID"
+    UPDATED_TEMPLATE_DATA='{"ImageId":"'$IMAGE_ID'"}'
+fi
+echo
+
+# Step 4: Create new launch template version
+echo "[Create new launch template version]"
+
+if [[ "$LIVE_MODE" == "true" ]]; then
+    read -p "Create new launch template version? (y/N): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        CREATE_VERSION_OUTPUT=$(aws ec2 create-launch-template-version --region "$REGION" --launch-template-id "$LAUNCH_TEMPLATE_ID" --launch-template-data "$UPDATED_TEMPLATE_DATA" --output json)
+        NEW_VERSION=$(echo "$CREATE_VERSION_OUTPUT" | jq -r '.LaunchTemplateVersion.VersionNumber')
+        echo "✓ Created launch template version: $NEW_VERSION"
+    else
+        echo "Skipped: Create new launch template version"
+        exit 1
+    fi
+else
+    echo "DEBUG MODE: Would create launch template version"
+    NEW_VERSION="XX"
+fi
+echo
+
+# Step 5: Optional - Set default version to new version
+echo "[Set default launch template version]"
+if [[ "$LIVE_MODE" == "true" ]]; then
+    read -p "Do you want to update the default template to version $NEW_VERSION? (y/N): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        CMD5="aws ec2 modify-launch-template --region \"$REGION\" --launch-template-id \"$LAUNCH_TEMPLATE_ID\" --default-version \"$NEW_VERSION\""
+        echo "Command: $CMD5"
+        read -p "Execute this command? (y/N): " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            aws ec2 modify-launch-template --region "$REGION" --launch-template-id "$LAUNCH_TEMPLATE_ID" --default-version "$NEW_VERSION"
+            echo "✓ Default version updated to $NEW_VERSION"
+            DEFAULT_VERSION="$NEW_VERSION"
+        else
+            echo "Skipped: Set default launch template version"
+        fi
+    else
+        echo "Keeping current default version: $DEFAULT_VERSION"
+    fi
+else
+    echo "DEBUG MODE: Would prompt to update default version to $NEW_VERSION"
+fi
+echo
+
+if [[ "$LIVE_MODE" == "false" ]]; then
+    echo "=== DEBUG MODE COMPLETE ==="
+    echo "Run with --live flag to execute commands with confirmation"
+else
+    echo "=== DEPLOYMENT COMPLETE ==="
+    echo "- Image ID: $IMAGE_ID"
+    echo "- New template version: $NEW_VERSION"
+    echo "- Default version: $DEFAULT_VERSION"
+fi
