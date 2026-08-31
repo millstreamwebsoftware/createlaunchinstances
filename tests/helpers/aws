@@ -321,6 +321,7 @@ case "$service $operation" in
     "autoscaling describe-auto-scaling-groups")
         jq -cn \
             --arg selected "$TEST_INSTANCE_ID" \
+            --arg selected_health "${MOCK_SELECTED_INSTANCE_HEALTH:-Healthy}" \
             --arg other "$OTHER_INSTANCE_ID" '
             {
                 AutoScalingGroups: [
@@ -330,7 +331,7 @@ case "$service $operation" in
                         Instances: [
                             {
                                 InstanceId: $selected,
-                                HealthStatus: "Healthy",
+                                HealthStatus: $selected_health,
                                 LifecycleState: "InService"
                             },
                             {

@@ -26,6 +26,7 @@ setup_mock() {
     export AMI_WAIT_TIMEOUT_SECONDS=5
     export AMI_POLL_INTERVAL_SECONDS=1
     unset MOCK_ACCOUNT_ID MOCK_ALLOW_WRITES MOCK_PENDING_IMAGES
+    unset MOCK_SELECTED_INSTANCE_HEALTH
     unset MOCK_SOURCE_TEMPLATE_MODE MOCK_NEW_TEMPLATE_MODE
     : > "$MOCK_AWS_LOG"
 }
@@ -191,6 +192,18 @@ test_unsafe_source_template_is_rejected() {
     return "$result"
 }
 
+test_live_mode_rejects_source_outside_healthy_capacity() {
+    setup_mock
+    export MOCK_SELECTED_INSTANCE_HEALTH=Unhealthy
+    run_command bash "$SCRIPT" --live --profile test-profile "$TEST_INSTANCE_ID"
+    assert_failure &&
+        assert_output_contains "not Healthy and InService" &&
+        assert_log_excludes "create-image"
+    local result=$?
+    teardown_mock
+    return "$result"
+}
+
 test_live_mode_changes_only_image_id_and_promotes() {
     setup_mock
     export MOCK_ALLOW_WRITES=true
@@ -264,6 +277,7 @@ run_test "invalid instance ID fails before AWS" test_invalid_instance_id_fails_b
 run_test "debug mode validates without writes" test_debug_mode_validates_and_does_not_write
 run_test "wrong AWS account is rejected" test_wrong_account_is_rejected
 run_test "unsafe source template is rejected" test_unsafe_source_template_is_rejected
+run_test "live mode rejects a source outside healthy capacity" test_live_mode_rejects_source_outside_healthy_capacity
 run_test "live mode changes only ImageId and promotes" test_live_mode_changes_only_image_id_and_promotes
 run_test "matching pending AMI is reused" test_matching_pending_image_is_reused
 run_test "unsafe created version is not promoted" test_unsafe_created_version_is_not_promoted

@@ -433,11 +433,11 @@ validate_source_instance() {
             | select(.HealthStatus == "Healthy" and .LifecycleState == "InService")]
         | length
     ') || die "Unable to count healthy Auto Scaling instances."
-    selected_instance_healthy=$(printf '%s\n' "$asg_json" | jq -r --arg instance_id "$INSTANCE_ID" '
+    selected_instance_healthy=$(printf '%s\n' "$asg_json" | jq -er --arg instance_id "$INSTANCE_ID" '
         [.AutoScalingGroups[0].Instances[]
             | select(.InstanceId == $instance_id and .HealthStatus == "Healthy" and .LifecycleState == "InService")]
         | length
-    ')
+    ') || die "Unable to determine whether source instance $INSTANCE_ID is Healthy and InService."
 
     if [[ "$LIVE_MODE" == "true" && "$SOURCE_INSTANCE_STATE" == "running" ]]; then
         [[ "$selected_instance_healthy" -eq 1 ]] || \
