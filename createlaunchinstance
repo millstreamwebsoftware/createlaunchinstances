@@ -1,252 +1,762 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-set -e
+set -Eeuo pipefail
 
-REGION="ap-southeast-2"
-LAUNCH_TEMPLATE_ID="lt-04ceb7a70df074f2a"
+readonly REGION="ap-southeast-2"
+readonly LAUNCH_TEMPLATE_ID="lt-04ceb7a70df074f2a"
+readonly EXPECTED_LAUNCH_TEMPLATE_NAME="Millstream-App-Server-Template"
+readonly EXPECTED_AWS_ACCOUNT_ID="450153405013"
+readonly DEFAULT_READ_AWS_PROFILE_NAME="millstream-readonly"
+readonly DEFAULT_WRITE_AWS_PROFILE_NAME="millstream-readwrite"
+readonly AUTO_SCALING_GROUP_NAME="Millstream-Production-Auto-Scaling-Group"
+readonly IMAGE_NAME_PREFIX="Millstream-App-Server-"
 
 LIVE_MODE=false
 INSTANCE_ID=""
+AWS_PROFILE_NAME=""
+AMI_WAIT_TIMEOUT_SECONDS="${AMI_WAIT_TIMEOUT_SECONDS:-3600}"
+AMI_POLL_INTERVAL_SECONDS="${AMI_POLL_INTERVAL_SECONDS:-15}"
 
-# Parse arguments
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        --live)
-            LIVE_MODE=true
-            shift
-            ;;
-        -*)
-            echo "Unknown option $1"
-            echo "Usage: $0 [--live] [instance-id]"
-            exit 1
-            ;;
-        *)
-            INSTANCE_ID="$1"
-            shift
-            ;;
-    esac
-done
+ACCOUNT_ID=""
+DEFAULT_VERSION=""
+LATEST_VERSION=""
+SOURCE_TEMPLATE_DATA=""
+SOURCE_TEMPLATE_IMAGE_ID=""
+SOURCE_TEMPLATE_INSTANCE_TYPE=""
+SOURCE_TEMPLATE_ROOT_DEVICE=""
+SOURCE_INSTANCE_DATA=""
+SOURCE_INSTANCE_STATE=""
+SOURCE_INSTANCE_NAME=""
+SOURCE_INSTANCE_ASG=""
+SOURCE_INSTANCE_ARCHITECTURE=""
+SOURCE_INSTANCE_VIRTUALIZATION=""
+IMAGE_ID=""
+IMAGE_NAME=""
+IMAGE_DATA=""
+NEW_VERSION=""
+DEFAULT_UPDATED=false
 
-if [[ -z "$INSTANCE_ID" ]]; then
-    echo "Fetching EC2 instances..."
-    selection=$(
-        aws ec2 describe-instances \
-            --region "$REGION" \
-            --query "Reservations[*].Instances[*].[InstanceId,InstanceType,State.Name,Tags[?Key=='Name']|[0].Value,Placement.AvailabilityZone]" \
-            --output text | \
-        awk -F'\t' '{ printf "%s\t%s\t%s\t%s\t%s\n", $1, $2, $3, $4, $5 }' | \
-        fzf --prompt="Select EC2 instance to create image from: " \
-            --with-nth=1,2,5 \
-            --header="ID\tType\tAZ\tState\tName" \
-            --preview="echo -e \"Type:\t{2}\nState:\t{3}\nName:\t{4}\nAZ:\t{5}\"" \
-            --preview-window=down:4
-    )
-    
-    INSTANCE_ID=$(echo "$selection" | awk '{print $1}')
-    
-    if [[ -z "$INSTANCE_ID" ]]; then
-        echo "No instance selected."
-        exit 1
-    fi
-fi
+usage() {
+    cat <<EOF
+Usage: $0 [--live] [--profile PROFILE] [instance-id]
 
-# Function to execute or show commands
-execute_command() {
-    local cmd="$1"
-    local description="$2"
-    
-    echo "[$description]"
-    echo "Command: $cmd"
-    
-    if [[ "$LIVE_MODE" == "true" ]]; then
-        read -p "Execute this command? (y/N): " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            eval "$cmd"
+Create an AMI from an EC2 instance and prepare a new version of the
+$EXPECTED_LAUNCH_TEMPLATE_NAME launch template.
+
+Options:
+  --live             Create AWS resources after confirmation. Without this
+                     flag, perform read-only validation and preview the change.
+  --profile PROFILE  AWS CLI profile to use. Defaults to
+                     $DEFAULT_READ_AWS_PROFILE_NAME, or
+                     $DEFAULT_WRITE_AWS_PROFILE_NAME with --live.
+  -h, --help         Show this help.
+EOF
+}
+
+die() {
+    printf 'ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+warn() {
+    printf 'WARNING: %s\n' "$*" >&2
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+confirm() {
+    local prompt="$1"
+    local reply=""
+
+    read -r -p "$prompt (y/N): " reply || return 1
+    [[ "$reply" =~ ^[Yy]$ ]]
+}
+
+validate_positive_integer() {
+    local label="$1"
+    local value="$2"
+
+    [[ "$value" =~ ^[1-9][0-9]*$ ]] || die "$label must be a positive integer; got '$value'."
+}
+
+validate_instance_id() {
+    [[ "$1" =~ ^i-[0-9a-f]{8}([0-9a-f]{9})?$ ]] || die "Invalid EC2 instance ID: $1"
+}
+
+validate_image_id() {
+    [[ "$1" =~ ^ami-[0-9a-f]{8}([0-9a-f]{9})?$ ]] || die "Invalid AMI ID returned by AWS: $1"
+}
+
+aws_cli() {
+    command aws \
+        --profile "$AWS_PROFILE_NAME" \
+        --region "$REGION" \
+        --no-cli-pager \
+        "$@"
+}
+
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --live)
+                LIVE_MODE=true
+                shift
+                ;;
+            --profile)
+                [[ $# -ge 2 ]] || die "--profile requires a value."
+                AWS_PROFILE_NAME="$2"
+                shift 2
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            --)
+                shift
+                if [[ $# -gt 0 ]]; then
+                    [[ $# -eq 1 && -z "$INSTANCE_ID" ]] || \
+                        die "Only one instance ID can be supplied."
+                    INSTANCE_ID="$1"
+                    shift
+                fi
+                break
+                ;;
+            -*)
+                die "Unknown option: $1"
+                ;;
+            *)
+                [[ -z "$INSTANCE_ID" ]] || die "Only one instance ID can be supplied."
+                INSTANCE_ID="$1"
+                shift
+                ;;
+        esac
+    done
+
+    [[ $# -eq 0 ]] || die "Unexpected arguments: $*"
+    if [[ -z "$AWS_PROFILE_NAME" ]]; then
+        if [[ "$LIVE_MODE" == "true" ]]; then
+            AWS_PROFILE_NAME="$DEFAULT_WRITE_AWS_PROFILE_NAME"
         else
-            echo "Skipped: $description"
-            return 1
+            AWS_PROFILE_NAME="$DEFAULT_READ_AWS_PROFILE_NAME"
         fi
-    else
-        echo "DEBUG MODE: Command would be executed"
-        echo
+    fi
+    [[ -n "$AWS_PROFILE_NAME" ]] || die "AWS profile cannot be empty."
+    if [[ -n "$INSTANCE_ID" ]]; then
+        validate_instance_id "$INSTANCE_ID"
     fi
 }
 
-echo "Selected instance: $INSTANCE_ID"
+check_requirements() {
+    require_command aws
+    require_command awk
+    require_command jq
+    require_command diff
+    if [[ -z "$INSTANCE_ID" ]]; then
+        require_command fzf
+    fi
 
-# Check for existing AMI creation in progress for this instance
-echo "Checking for existing AMI creation for this instance..."
-SKIP_CREATE=false
-if [[ "$LIVE_MODE" == "true" ]]; then
-    PENDING_IMAGES=$(aws ec2 describe-images \
-        --region "$REGION" \
+    validate_positive_integer "AMI_WAIT_TIMEOUT_SECONDS" "$AMI_WAIT_TIMEOUT_SECONDS"
+    validate_positive_integer "AMI_POLL_INTERVAL_SECONDS" "$AMI_POLL_INTERVAL_SECONDS"
+}
+
+verify_account_and_template() {
+    local identity_json=""
+    local template_json=""
+    local template_count=""
+    local template_name=""
+
+    printf 'Verifying AWS account and launch template...\n'
+
+    identity_json=$(aws_cli sts get-caller-identity --output json) || \
+        die "Unable to authenticate with AWS profile '$AWS_PROFILE_NAME'. If its MFA session has expired, prime the profile and retry."
+    ACCOUNT_ID=$(printf '%s\n' "$identity_json" | jq -er '.Account') || \
+        die "AWS did not return an account ID."
+
+    [[ "$ACCOUNT_ID" == "$EXPECTED_AWS_ACCOUNT_ID" ]] || \
+        die "Profile '$AWS_PROFILE_NAME' targets AWS account '$ACCOUNT_ID', not the expected Millstream account."
+
+    template_json=$(aws_cli ec2 describe-launch-templates \
+        --launch-template-ids "$LAUNCH_TEMPLATE_ID" \
+        --output json) || die "Unable to describe launch template $LAUNCH_TEMPLATE_ID."
+
+    template_count=$(printf '%s\n' "$template_json" | jq -er '.LaunchTemplates | length') || \
+        die "Invalid launch template response."
+    [[ "$template_count" -eq 1 ]] || die "Expected exactly one launch template; found $template_count."
+
+    template_name=$(printf '%s\n' "$template_json" | jq -er '.LaunchTemplates[0].LaunchTemplateName') || \
+        die "Launch template name is missing."
+    [[ "$template_name" == "$EXPECTED_LAUNCH_TEMPLATE_NAME" ]] || \
+        die "Launch template $LAUNCH_TEMPLATE_ID is named '$template_name', not '$EXPECTED_LAUNCH_TEMPLATE_NAME'."
+
+    DEFAULT_VERSION=$(printf '%s\n' "$template_json" | jq -er '.LaunchTemplates[0].DefaultVersionNumber') || \
+        die "Launch template default version is missing."
+    LATEST_VERSION=$(printf '%s\n' "$template_json" | jq -er '.LaunchTemplates[0].LatestVersionNumber') || \
+        die "Launch template latest version is missing."
+
+    printf '  Profile: %s\n' "$AWS_PROFILE_NAME"
+    printf '  Account: verified Millstream account\n'
+    printf '  Template: %s (%s)\n' "$EXPECTED_LAUNCH_TEMPLATE_NAME" "$LAUNCH_TEMPLATE_ID"
+    printf '  Default version: %s; latest version: %s\n' "$DEFAULT_VERSION" "$LATEST_VERSION"
+}
+
+fetch_image_data() {
+    local image_id="$1"
+    local response=""
+    local count=""
+
+    response=$(aws_cli ec2 describe-images --image-ids "$image_id" --output json) || \
+        die "Unable to describe AMI $image_id."
+    count=$(printf '%s\n' "$response" | jq -er '.Images | length') || \
+        die "Invalid response while describing AMI $image_id."
+    [[ "$count" -eq 1 ]] || die "Expected exactly one AMI for $image_id; found $count."
+
+    printf '%s\n' "$response" | jq -cer '.Images[0]'
+}
+
+template_safety_violations() {
+    local template_data="$1"
+    local root_device="$2"
+
+    printf '%s\n' "$template_data" | jq -r --arg root "$root_device" '
+        [
+            (if (.Placement.AvailabilityZone? // "") != ""
+                then "Placement.AvailabilityZone" else empty end),
+            (if (.Placement.AvailabilityZoneId? // "") != ""
+                then "Placement.AvailabilityZoneId" else empty end),
+            (.NetworkInterfaces[]? |
+                if (.NetworkInterfaceId? // "") != ""
+                    then "NetworkInterfaces[].NetworkInterfaceId" else empty end),
+            (.NetworkInterfaces[]? |
+                if (.SubnetId? // "") != ""
+                    then "NetworkInterfaces[].SubnetId" else empty end),
+            (.NetworkInterfaces[]? |
+                if (.PrivateIpAddress? // "") != ""
+                    then "NetworkInterfaces[].PrivateIpAddress" else empty end),
+            (.NetworkInterfaces[]? |
+                if ((.PrivateIpAddresses? // []) | length) > 0
+                    then "NetworkInterfaces[].PrivateIpAddresses" else empty end),
+            (.NetworkInterfaces[]? |
+                if ((.Ipv6Addresses? // []) | length) > 0
+                    then "NetworkInterfaces[].Ipv6Addresses" else empty end),
+            (.NetworkInterfaces[]? |
+                if ((.Ipv4Prefixes? // []) | length) > 0
+                    then "NetworkInterfaces[].Ipv4Prefixes" else empty end),
+            (.NetworkInterfaces[]? |
+                if ((.Ipv6Prefixes? // []) | length) > 0
+                    then "NetworkInterfaces[].Ipv6Prefixes" else empty end),
+            (.BlockDeviceMappings[]? |
+                select(.DeviceName == $root and (.Ebs.SnapshotId? // "") != "") |
+                "BlockDeviceMappings[root].Ebs.SnapshotId")
+        ]
+        | unique
+        | .[]
+    '
+}
+
+validate_template_safety() {
+    local label="$1"
+    local template_data="$2"
+    local root_device="$3"
+    local violations=""
+
+    violations=$(template_safety_violations "$template_data" "$root_device") || \
+        die "$label is not valid launch template JSON."
+
+    if [[ -n "$violations" ]]; then
+        printf 'Unsafe fields found in %s:\n' "$label" >&2
+        while IFS= read -r violation; do
+            printf '  - %s\n' "$violation" >&2
+        done <<< "$violations"
+        die "$label contains instance-specific data that is unsafe for the Auto Scaling Group."
+    fi
+}
+
+fetch_source_template_data() {
+    local version_json=""
+    local version_count=""
+    local source_image_data=""
+
+    version_json=$(aws_cli ec2 describe-launch-template-versions \
+        --launch-template-id "$LAUNCH_TEMPLATE_ID" \
+        --versions "$DEFAULT_VERSION" \
+        --output json) || die "Unable to read launch template version $DEFAULT_VERSION."
+
+    version_count=$(printf '%s\n' "$version_json" | jq -er '.LaunchTemplateVersions | length') || \
+        die "Invalid launch template version response."
+    [[ "$version_count" -eq 1 ]] || \
+        die "Expected one launch template version for $DEFAULT_VERSION; found $version_count."
+
+    SOURCE_TEMPLATE_DATA=$(printf '%s\n' "$version_json" | \
+        jq -cer '.LaunchTemplateVersions[0].LaunchTemplateData') || \
+        die "Launch template version $DEFAULT_VERSION has no template data."
+    SOURCE_TEMPLATE_IMAGE_ID=$(printf '%s\n' "$SOURCE_TEMPLATE_DATA" | jq -er '.ImageId') || \
+        die "Launch template version $DEFAULT_VERSION has no AMI."
+    SOURCE_TEMPLATE_INSTANCE_TYPE=$(printf '%s\n' "$SOURCE_TEMPLATE_DATA" | jq -er '.InstanceType') || \
+        die "Launch template version $DEFAULT_VERSION has no instance type."
+
+    validate_image_id "$SOURCE_TEMPLATE_IMAGE_ID"
+    source_image_data=$(fetch_image_data "$SOURCE_TEMPLATE_IMAGE_ID")
+    SOURCE_TEMPLATE_ROOT_DEVICE=$(printf '%s\n' "$source_image_data" | jq -er '.RootDeviceName') || \
+        die "Unable to determine the root device for AMI $SOURCE_TEMPLATE_IMAGE_ID."
+
+    validate_template_safety "current default template version $DEFAULT_VERSION" \
+        "$SOURCE_TEMPLATE_DATA" "$SOURCE_TEMPLATE_ROOT_DEVICE"
+}
+
+select_instance() {
+    local instances_json=""
+    local choices=""
+    local selection=""
+
+    if [[ -n "$INSTANCE_ID" ]]; then
+        validate_instance_id "$INSTANCE_ID"
+        return
+    fi
+
+    printf 'Fetching running and stopped EC2 instances...\n'
+    instances_json=$(aws_cli ec2 describe-instances \
+        --filters "Name=instance-state-name,Values=running,stopped" \
+        --output json) || die "Unable to list EC2 instances."
+
+    choices=$(printf '%s\n' "$instances_json" | jq -r '
+        .Reservations[].Instances[]
+        | [
+            .InstanceId,
+            .InstanceType,
+            .State.Name,
+            ([.Tags[]? | select(.Key == "Name") | .Value][0] // "-"),
+            .Placement.AvailabilityZone,
+            ([.Tags[]? | select(.Key == "aws:autoscaling:groupName") | .Value][0] // "unmanaged")
+        ]
+        | @tsv
+    ') || die "Unable to format EC2 instance choices."
+    [[ -n "$choices" ]] || die "No running or stopped instances were found in $REGION."
+
+    if ! selection=$(printf '%s\n' "$choices" | fzf \
+        --delimiter=$'\t' \
+        --prompt="Select EC2 instance to image: " \
+        --header=$'ID\tType\tState\tName\tAZ\tAuto Scaling Group'); then
+        die "No instance selected."
+    fi
+
+    INSTANCE_ID=$(printf '%s\n' "$selection" | awk -F'\t' '{print $1}')
+    validate_instance_id "$INSTANCE_ID"
+}
+
+validate_source_instance() {
+    local response=""
+    local instance_count=""
+    local instance_type_json=""
+    local current_generation=""
+    local architecture_supported=false
+    local virtualization_supported=false
+    local asg_json=""
+    local asg_count=""
+    local healthy_instances=""
+    local selected_instance_healthy=""
+
+    response=$(aws_cli ec2 describe-instances \
+        --instance-ids "$INSTANCE_ID" \
+        --output json) || die "Unable to describe instance $INSTANCE_ID."
+    instance_count=$(printf '%s\n' "$response" | jq -er '[.Reservations[].Instances[]] | length') || \
+        die "Invalid response while describing instance $INSTANCE_ID."
+    [[ "$instance_count" -eq 1 ]] || die "Instance $INSTANCE_ID was not found in $REGION."
+
+    SOURCE_INSTANCE_DATA=$(printf '%s\n' "$response" | jq -cer '.Reservations[0].Instances[0]') || \
+        die "Unable to parse instance $INSTANCE_ID."
+    SOURCE_INSTANCE_STATE=$(printf '%s\n' "$SOURCE_INSTANCE_DATA" | jq -er '.State.Name') || \
+        die "Instance $INSTANCE_ID has no state."
+    [[ "$SOURCE_INSTANCE_STATE" == "running" || "$SOURCE_INSTANCE_STATE" == "stopped" ]] || \
+        die "Instance $INSTANCE_ID must be running or stopped; it is $SOURCE_INSTANCE_STATE."
+
+    SOURCE_INSTANCE_NAME=$(printf '%s\n' "$SOURCE_INSTANCE_DATA" | \
+        jq -r '[.Tags[]? | select(.Key == "Name") | .Value][0] // "unnamed"')
+    SOURCE_INSTANCE_ASG=$(printf '%s\n' "$SOURCE_INSTANCE_DATA" | \
+        jq -r '[.Tags[]? | select(.Key == "aws:autoscaling:groupName") | .Value][0] // "unmanaged"')
+    SOURCE_INSTANCE_ARCHITECTURE=$(printf '%s\n' "$SOURCE_INSTANCE_DATA" | jq -er '.Architecture') || \
+        die "Instance $INSTANCE_ID has no architecture."
+    SOURCE_INSTANCE_VIRTUALIZATION=$(printf '%s\n' "$SOURCE_INSTANCE_DATA" | jq -er '.VirtualizationType') || \
+        die "Instance $INSTANCE_ID has no virtualization type."
+
+    instance_type_json=$(aws_cli ec2 describe-instance-types \
+        --instance-types "$SOURCE_TEMPLATE_INSTANCE_TYPE" \
+        --output json) || die "Unable to describe instance type $SOURCE_TEMPLATE_INSTANCE_TYPE."
+
+    if printf '%s\n' "$instance_type_json" | jq -e \
+        --arg architecture "$SOURCE_INSTANCE_ARCHITECTURE" \
+        '.InstanceTypes[0].ProcessorInfo.SupportedArchitectures | index($architecture) != null' \
+        >/dev/null; then
+        architecture_supported=true
+    fi
+    if printf '%s\n' "$instance_type_json" | jq -e \
+        --arg virtualization "$SOURCE_INSTANCE_VIRTUALIZATION" \
+        '.InstanceTypes[0].SupportedVirtualizationTypes | index($virtualization) != null' \
+        >/dev/null; then
+        virtualization_supported=true
+    fi
+
+    [[ "$architecture_supported" == "true" ]] || \
+        die "An AMI from $INSTANCE_ID would use $SOURCE_INSTANCE_ARCHITECTURE, which $SOURCE_TEMPLATE_INSTANCE_TYPE does not support."
+    [[ "$virtualization_supported" == "true" ]] || \
+        die "An AMI from $INSTANCE_ID would use $SOURCE_INSTANCE_VIRTUALIZATION virtualization, which $SOURCE_TEMPLATE_INSTANCE_TYPE does not support."
+
+    current_generation=$(printf '%s\n' "$instance_type_json" | jq -r '.InstanceTypes[0].CurrentGeneration // false')
+
+    printf 'Selected instance:\n'
+    printf '  ID: %s\n' "$INSTANCE_ID"
+    printf '  Name: %s\n' "$SOURCE_INSTANCE_NAME"
+    printf '  State: %s\n' "$SOURCE_INSTANCE_STATE"
+    printf '  Auto Scaling Group: %s\n' "$SOURCE_INSTANCE_ASG"
+    printf '  Resulting AMI: %s / %s\n' "$SOURCE_INSTANCE_ARCHITECTURE" "$SOURCE_INSTANCE_VIRTUALIZATION"
+    printf '  Template instance type: %s\n' "$SOURCE_TEMPLATE_INSTANCE_TYPE"
+
+    if [[ "$current_generation" != "true" ]]; then
+        warn "$SOURCE_TEMPLATE_INSTANCE_TYPE is a previous-generation instance type. This script preserves it; modernization requires a separately tested HVM-compatible AMI and template change."
+    fi
+
+    if [[ "$SOURCE_INSTANCE_ASG" != "$AUTO_SCALING_GROUP_NAME" ]]; then
+        warn "The selected instance is not a member of $AUTO_SCALING_GROUP_NAME. Confirm that it is the intended image source before using live mode."
+        return
+    fi
+
+    asg_json=$(aws_cli autoscaling describe-auto-scaling-groups \
+        --auto-scaling-group-names "$AUTO_SCALING_GROUP_NAME" \
+        --output json) || die "Unable to inspect Auto Scaling Group $AUTO_SCALING_GROUP_NAME."
+    asg_count=$(printf '%s\n' "$asg_json" | jq -er '.AutoScalingGroups | length') || \
+        die "Invalid Auto Scaling Group response."
+    [[ "$asg_count" -eq 1 ]] || die "Auto Scaling Group $AUTO_SCALING_GROUP_NAME was not found."
+
+    healthy_instances=$(printf '%s\n' "$asg_json" | jq -er '
+        [.AutoScalingGroups[0].Instances[]
+            | select(.HealthStatus == "Healthy" and .LifecycleState == "InService")]
+        | length
+    ') || die "Unable to count healthy Auto Scaling instances."
+    selected_instance_healthy=$(printf '%s\n' "$asg_json" | jq -r --arg instance_id "$INSTANCE_ID" '
+        [.AutoScalingGroups[0].Instances[]
+            | select(.InstanceId == $instance_id and .HealthStatus == "Healthy" and .LifecycleState == "InService")]
+        | length
+    ')
+
+    if [[ "$LIVE_MODE" == "true" && "$SOURCE_INSTANCE_STATE" == "running" ]]; then
+        [[ "$selected_instance_healthy" -eq 1 ]] || \
+            die "Source instance $INSTANCE_ID is not Healthy and InService in the Auto Scaling Group."
+        [[ "$healthy_instances" -ge 2 ]] || \
+            die "Refusing to reboot an Auto Scaling source when fewer than two instances are Healthy and InService."
+    fi
+}
+
+find_pending_image() {
+    local response=""
+    local count=""
+
+    printf 'Checking for a pending AMI from %s...\n' "$INSTANCE_ID"
+    response=$(aws_cli ec2 describe-images \
         --owners self \
-        --filters "Name=state,Values=pending" "Name=name,Values=Millstream-App-Server-*" \
-        --query "Images[].[Name,State,ImageId]" \
-        --output text)
-    
-    if [[ -n "$PENDING_IMAGES" ]]; then
-        echo "Found existing AMI creation in progress:"
-        echo "$PENDING_IMAGES" | while read name state image_id; do
-            echo "  - $name ($image_id) - $state"
-        done
-        
-        # Use the first pending image found  
-        IMAGE_ID=$(echo "$PENDING_IMAGES" | head -n1 | awk '{print $3}')
-        IMAGE_NAME=$(echo "$PENDING_IMAGES" | head -n1 | awk '{print $1}')
-        echo "DEBUG: Parsed IMAGE_ID='$IMAGE_ID', IMAGE_NAME='$IMAGE_NAME'"
-        echo "Using existing pending AMI: $IMAGE_ID ($IMAGE_NAME)"
-        SKIP_CREATE=true
-    else
-        echo "No pending AMI creation found."
-        IMAGE_NAME="Millstream-App-Server-$(TZ='Australia/Perth' date +"%F-%H-%M-%S")"
-        echo "Will create new image: $IMAGE_NAME"
+        --filters \
+            "Name=state,Values=pending" \
+            "Name=name,Values=${IMAGE_NAME_PREFIX}*" \
+            "Name=source-instance-id,Values=$INSTANCE_ID" \
+        --output json) || die "Unable to check for pending AMIs."
+
+    count=$(printf '%s\n' "$response" | jq -er '.Images | length') || \
+        die "Invalid pending AMI response."
+
+    case "$count" in
+        0)
+            printf '  No matching pending AMI found.\n'
+            ;;
+        1)
+            IMAGE_ID=$(printf '%s\n' "$response" | jq -er '.Images[0].ImageId') || \
+                die "Pending AMI has no image ID."
+            IMAGE_NAME=$(printf '%s\n' "$response" | jq -er '.Images[0].Name') || \
+                die "Pending AMI has no name."
+            validate_image_id "$IMAGE_ID"
+            printf '  Reusing %s (%s), which was created from this instance.\n' "$IMAGE_ID" "$IMAGE_NAME"
+            ;;
+        *)
+            printf 'Multiple matching pending AMIs were found:\n' >&2
+            printf '%s\n' "$response" | jq -r '.Images[] | "  - \(.ImageId) \(.Name) created \(.CreationDate)"' >&2
+            die "Wait for or resolve the duplicate pending AMIs before continuing."
+            ;;
+    esac
+}
+
+preview_change() {
+    local preview_image_id="<new AMI created from $INSTANCE_ID>"
+
+    if [[ -n "$IMAGE_ID" ]]; then
+        preview_image_id="$IMAGE_ID (currently pending)"
     fi
-else
-    echo "DEBUG: Would check for pending AMI creation"
-    IMAGE_NAME="Millstream-App-Server-$(TZ='Australia/Perth' date +"%F-%H-%M-%S")"
-    echo "Image name will be: $IMAGE_NAME"
-fi
-echo
 
-# Get current default version from AWS
-echo "Getting current default version from launch template..."
-if [[ "$LIVE_MODE" == "true" ]]; then
-    DEFAULT_VERSION=$(aws ec2 describe-launch-templates --region "$REGION" --launch-template-ids "$LAUNCH_TEMPLATE_ID" --query 'LaunchTemplates[0].DefaultVersionNumber' --output text)
-    echo "Current default version: $DEFAULT_VERSION"
-else
-    DEFAULT_VERSION="XX"
-    echo "DEBUG: Would fetch current default version (currently: $DEFAULT_VERSION)"
-fi
-echo
+    printf '\n=== READ-ONLY PREVIEW ===\n'
+    printf 'Source launch template version: %s\n' "$DEFAULT_VERSION"
+    printf 'Configuration change allowed:\n'
+    printf '  ImageId: %s -> %s\n' "$SOURCE_TEMPLATE_IMAGE_ID" "$preview_image_id"
+    printf 'All other launch template fields will be inherited from version %s and verified unchanged.\n' "$DEFAULT_VERSION"
+    printf 'No AWS resources were changed. Run with --live to create and promote the AMI.\n'
+}
 
-if [[ "$LIVE_MODE" == "false" ]]; then
-    echo "=== DEBUG MODE - Commands that would be executed ==="
-    echo
-else
-    echo "=== LIVE MODE - Commands will be executed with confirmation ==="
-    echo
-fi
+create_image() {
+    local create_output=""
+    local description=""
 
-# Step 1: Create AMI (skip if pending AMI exists)
-if [[ "$SKIP_CREATE" == "true" ]]; then
-    echo "[Create AMI from instance]"
-    echo "SKIPPED: Using existing pending AMI $IMAGE_ID"
-    echo
-else
-    CMD1="aws ec2 create-image --region \"$REGION\" --name \"$IMAGE_NAME\" --instance-id \"$INSTANCE_ID\" --output json"
-    echo "[Create AMI from instance]"
-    echo "Command: $CMD1"
-    
-    if [[ "$LIVE_MODE" == "true" ]]; then
-        read -p "Execute this command? (y/N): " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            CREATE_IMAGE_OUTPUT=$(aws ec2 create-image --region "$REGION" --name "$IMAGE_NAME" --instance-id "$INSTANCE_ID" --output json)
-            IMAGE_ID=$(echo "$CREATE_IMAGE_OUTPUT" | jq -r '.ImageId')
-            echo "Created image: $IMAGE_ID"
-        else
-            echo "Skipped: Create AMI from instance"
-            exit 1
-        fi
-    else
-        echo "DEBUG MODE: Command would be executed"
-        IMAGE_ID="ami-xxxxxxxxx"
-        echo "DEBUG: Would create image with ID: $IMAGE_ID"
+    IMAGE_NAME="${IMAGE_NAME_PREFIX}$(TZ='Australia/Perth' date +'%F-%H-%M-%S')"
+    description="Created from $INSTANCE_ID by createlaunchinstance"
+
+    if [[ "$SOURCE_INSTANCE_STATE" == "running" ]]; then
+        warn "AWS CreateImage will reboot $INSTANCE_ID to produce a consistent AMI. Existing traffic is not explicitly drained by this script."
     fi
-    echo
-fi
 
-# Step 2: Wait for image availability
-echo "[Wait for image to be available]"
-if [[ "$LIVE_MODE" == "true" ]]; then
-    echo "Waiting for AMI $IMAGE_ID to become available..."
-    echo "This may take several minutes. Checking every 15 seconds..."
-    
-    # Custom wait with progress
+    confirm "Create AMI '$IMAGE_NAME' from $INSTANCE_ID" || die "AMI creation cancelled."
+
+    create_output=$(aws_cli ec2 create-image \
+        --name "$IMAGE_NAME" \
+        --description "$description" \
+        --instance-id "$INSTANCE_ID" \
+        --reboot \
+        --output json) || die "AMI creation request failed."
+
+    IMAGE_ID=$(printf '%s\n' "$create_output" | jq -er '.ImageId') || \
+        die "AWS did not return an AMI ID."
+    validate_image_id "$IMAGE_ID"
+    printf 'Created AMI %s.\n' "$IMAGE_ID"
+}
+
+wait_for_image() {
+    local started_at=""
+    local now=""
+    local elapsed=""
+    local state=""
+    local reason=""
+    local response=""
+    local count=""
+
+    started_at=$(date +%s)
+    printf 'Waiting up to %s seconds for %s to become available...\n' \
+        "$AMI_WAIT_TIMEOUT_SECONDS" "$IMAGE_ID"
+
     while true; do
-        STATE=$(aws ec2 describe-images --region "$REGION" --image-ids "$IMAGE_ID" --query 'Images[0].State' --output text 2>/dev/null)
-        if [[ "$STATE" == "available" ]]; then
-            echo "✓ AMI is now available!"
-            break
-        elif [[ "$STATE" == "failed" ]]; then
-            echo "✗ AMI creation failed!"
-            exit 1
+        response=$(aws_cli ec2 describe-images --image-ids "$IMAGE_ID" --output json) || \
+            die "Unable to read the state of AMI $IMAGE_ID. The AMI was not deleted."
+        count=$(printf '%s\n' "$response" | jq -er '.Images | length') || \
+            die "Invalid response while waiting for AMI $IMAGE_ID."
+
+        if [[ "$count" -eq 0 ]]; then
+            state="not-visible-yet"
         else
-            echo "  Current state: $STATE (waiting...)"
-            sleep 15
+            state=$(printf '%s\n' "$response" | jq -er '.Images[0].State') || \
+                die "AMI $IMAGE_ID has no state."
         fi
+
+        case "$state" in
+            available)
+                IMAGE_DATA=$(printf '%s\n' "$response" | jq -cer '.Images[0]') || \
+                    die "Unable to parse available AMI $IMAGE_ID."
+                printf 'AMI %s is available.\n' "$IMAGE_ID"
+                return
+                ;;
+            failed)
+                reason=$(printf '%s\n' "$response" | jq -r '.Images[0].StateReason.Message // "No reason supplied"')
+                die "AMI $IMAGE_ID failed: $reason"
+                ;;
+            pending|not-visible-yet)
+                ;;
+            *)
+                die "AMI $IMAGE_ID entered unexpected state '$state'."
+                ;;
+        esac
+
+        now=$(date +%s)
+        elapsed=$((now - started_at))
+        if [[ "$elapsed" -ge "$AMI_WAIT_TIMEOUT_SECONDS" ]]; then
+            die "Timed out waiting for AMI $IMAGE_ID. It remains in AWS and can be inspected or reused after it becomes available."
+        fi
+
+        printf '  State: %s; elapsed: %ss\n' "$state" "$elapsed"
+        sleep "$AMI_POLL_INTERVAL_SECONDS"
     done
-else
-    echo "DEBUG MODE: Would wait for image to become available"
-fi
-echo
+}
 
-# Step 3: Get launch template data
-echo "[Get current launch template data]"
-if [[ "$LIVE_MODE" == "true" ]]; then
-    echo "Getting launch template data from instance $INSTANCE_ID..."
-    LAUNCH_TEMPLATE_DATA=$(aws ec2 get-launch-template-data --region "$REGION" --query 'LaunchTemplateData' --instance-id "$INSTANCE_ID" --output json)
-    UPDATED_TEMPLATE_DATA=$(echo "$LAUNCH_TEMPLATE_DATA" | jq --arg image_id "$IMAGE_ID" '.ImageId = $image_id')
-    echo "✓ Launch template data retrieved and updated with new image ID"
-else
-    echo "DEBUG MODE: Would fetch and update launch template data with new image ID"
-    UPDATED_TEMPLATE_DATA='{"ImageId":"'$IMAGE_ID'"}'
-fi
-echo
+validate_available_image() {
+    local source_instance_id=""
+    local state=""
+    local architecture=""
+    local virtualization=""
+    local root_device=""
+    local root_snapshot=""
 
-# Step 4: Create new launch template version
-echo "[Create new launch template version]"
+    [[ -n "$IMAGE_DATA" ]] || IMAGE_DATA=$(fetch_image_data "$IMAGE_ID")
 
-if [[ "$LIVE_MODE" == "true" ]]; then
-    read -p "Create new launch template version? (y/N): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        CREATE_VERSION_OUTPUT=$(aws ec2 create-launch-template-version --region "$REGION" --launch-template-id "$LAUNCH_TEMPLATE_ID" --launch-template-data "$UPDATED_TEMPLATE_DATA" --output json)
-        NEW_VERSION=$(echo "$CREATE_VERSION_OUTPUT" | jq -r '.LaunchTemplateVersion.VersionNumber')
-        echo "✓ Created launch template version: $NEW_VERSION"
-    else
-        echo "Skipped: Create new launch template version"
-        exit 1
+    source_instance_id=$(printf '%s\n' "$IMAGE_DATA" | jq -er '.SourceInstanceId') || \
+        die "AMI $IMAGE_ID has no source instance ID."
+    state=$(printf '%s\n' "$IMAGE_DATA" | jq -er '.State') || die "AMI $IMAGE_ID has no state."
+    architecture=$(printf '%s\n' "$IMAGE_DATA" | jq -er '.Architecture') || \
+        die "AMI $IMAGE_ID has no architecture."
+    virtualization=$(printf '%s\n' "$IMAGE_DATA" | jq -er '.VirtualizationType') || \
+        die "AMI $IMAGE_ID has no virtualization type."
+    root_device=$(printf '%s\n' "$IMAGE_DATA" | jq -er '.RootDeviceName') || \
+        die "AMI $IMAGE_ID has no root device."
+    root_snapshot=$(printf '%s\n' "$IMAGE_DATA" | jq -er --arg root "$root_device" '
+        [.BlockDeviceMappings[]
+            | select(.DeviceName == $root)
+            | .Ebs.SnapshotId][0]
+    ') || die "AMI $IMAGE_ID has no root snapshot."
+
+    [[ "$source_instance_id" == "$INSTANCE_ID" ]] || \
+        die "AMI $IMAGE_ID was created from $source_instance_id, not selected instance $INSTANCE_ID."
+    [[ "$state" == "available" ]] || die "AMI $IMAGE_ID is $state, not available."
+    [[ "$architecture" == "$SOURCE_INSTANCE_ARCHITECTURE" ]] || \
+        die "AMI architecture changed unexpectedly from $SOURCE_INSTANCE_ARCHITECTURE to $architecture."
+    [[ "$virtualization" == "$SOURCE_INSTANCE_VIRTUALIZATION" ]] || \
+        die "AMI virtualization changed unexpectedly from $SOURCE_INSTANCE_VIRTUALIZATION to $virtualization."
+
+    SOURCE_TEMPLATE_ROOT_DEVICE="$root_device"
+    printf 'Validated AMI source and root snapshot %s.\n' "$root_snapshot"
+}
+
+read_current_default_version() {
+    local response=""
+
+    response=$(aws_cli ec2 describe-launch-templates \
+        --launch-template-ids "$LAUNCH_TEMPLATE_ID" \
+        --output json) || die "Unable to re-read the launch template default version."
+    printf '%s\n' "$response" | jq -er '.LaunchTemplates[0].DefaultVersionNumber'
+}
+
+ensure_default_version_unchanged() {
+    local current_default=""
+
+    current_default=$(read_current_default_version) || die "Unable to determine the current default version."
+    [[ "$current_default" == "$DEFAULT_VERSION" ]] || \
+        die "Launch template default changed from $DEFAULT_VERSION to $current_default during this run. AMI $IMAGE_ID was retained, but no template change was made."
+}
+
+create_and_verify_template_version() {
+    local override_data=""
+    local expected_data=""
+    local create_output=""
+    local version_json=""
+    local version_count=""
+    local actual_data=""
+    local expected_canonical=""
+    local actual_canonical=""
+    local version_description=""
+    local client_token=""
+
+    override_data=$(jq -cn --arg image_id "$IMAGE_ID" '{ImageId: $image_id}')
+    expected_data=$(printf '%s\n' "$SOURCE_TEMPLATE_DATA" | \
+        jq -c --arg image_id "$IMAGE_ID" '.ImageId = $image_id') || \
+        die "Unable to build expected launch template data."
+
+    validate_template_safety "prospective launch template version" \
+        "$expected_data" "$SOURCE_TEMPLATE_ROOT_DEVICE"
+
+    printf '\nThe new template version will inherit version %s and change only:\n' "$DEFAULT_VERSION"
+    printf '  ImageId: %s -> %s\n' "$SOURCE_TEMPLATE_IMAGE_ID" "$IMAGE_ID"
+    confirm "Create this launch template version" || die "Launch template version creation cancelled. AMI $IMAGE_ID was retained."
+
+    ensure_default_version_unchanged
+
+    version_description="AMI $IMAGE_ID from $INSTANCE_ID"
+    client_token="createlaunchinstance-${LAUNCH_TEMPLATE_ID}-${DEFAULT_VERSION}-${IMAGE_ID}"
+    create_output=$(aws_cli ec2 create-launch-template-version \
+        --launch-template-id "$LAUNCH_TEMPLATE_ID" \
+        --source-version "$DEFAULT_VERSION" \
+        --version-description "$version_description" \
+        --client-token "$client_token" \
+        --launch-template-data "$override_data" \
+        --output json) || die "Unable to create the launch template version. AMI $IMAGE_ID was retained."
+
+    NEW_VERSION=$(printf '%s\n' "$create_output" | jq -er '.LaunchTemplateVersion.VersionNumber') || \
+        die "AWS created a template version but did not return its version number."
+
+    version_json=$(aws_cli ec2 describe-launch-template-versions \
+        --launch-template-id "$LAUNCH_TEMPLATE_ID" \
+        --versions "$NEW_VERSION" \
+        --output json) || die "Unable to verify new launch template version $NEW_VERSION."
+    version_count=$(printf '%s\n' "$version_json" | jq -er '.LaunchTemplateVersions | length') || \
+        die "Invalid response while verifying launch template version $NEW_VERSION."
+    [[ "$version_count" -eq 1 ]] || die "New launch template version $NEW_VERSION was not found."
+    actual_data=$(printf '%s\n' "$version_json" | jq -cer '.LaunchTemplateVersions[0].LaunchTemplateData') || \
+        die "New launch template version $NEW_VERSION has no data."
+
+    validate_template_safety "new launch template version $NEW_VERSION" \
+        "$actual_data" "$SOURCE_TEMPLATE_ROOT_DEVICE"
+
+    expected_canonical=$(printf '%s\n' "$expected_data" | jq -Sc .)
+    actual_canonical=$(printf '%s\n' "$actual_data" | jq -Sc .)
+    if [[ "$expected_canonical" != "$actual_canonical" ]]; then
+        printf 'Expected and actual launch template data differ:\n' >&2
+        diff -u \
+            <(printf '%s\n' "$expected_data" | jq -S .) \
+            <(printf '%s\n' "$actual_data" | jq -S .) >&2 || true
+        die "Version $NEW_VERSION was created but was not made default because fields other than ImageId changed."
     fi
-else
-    echo "DEBUG MODE: Would create launch template version"
-    NEW_VERSION="XX"
-fi
-echo
 
-# Step 5: Optional - Set default version to new version
-echo "[Set default launch template version]"
-if [[ "$LIVE_MODE" == "true" ]]; then
-    read -p "Do you want to update the default template to version $NEW_VERSION? (y/N): " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        CMD5="aws ec2 modify-launch-template --region \"$REGION\" --launch-template-id \"$LAUNCH_TEMPLATE_ID\" --default-version \"$NEW_VERSION\""
-        echo "Command: $CMD5"
-        read -p "Execute this command? (y/N): " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            aws ec2 modify-launch-template --region "$REGION" --launch-template-id "$LAUNCH_TEMPLATE_ID" --default-version "$NEW_VERSION"
-            echo "✓ Default version updated to $NEW_VERSION"
-            DEFAULT_VERSION="$NEW_VERSION"
-        else
-            echo "Skipped: Set default launch template version"
-        fi
-    else
-        echo "Keeping current default version: $DEFAULT_VERSION"
+    printf 'Verified launch template version %s: only ImageId changed.\n' "$NEW_VERSION"
+}
+
+offer_default_promotion() {
+    local current_default=""
+
+    if ! confirm "Set launch template version $NEW_VERSION as the default"; then
+        printf 'Version %s was created but not promoted. Default remains version %s.\n' \
+            "$NEW_VERSION" "$DEFAULT_VERSION"
+        return
     fi
-else
-    echo "DEBUG MODE: Would prompt to update default version to $NEW_VERSION"
-fi
-echo
 
-if [[ "$LIVE_MODE" == "false" ]]; then
-    echo "=== DEBUG MODE COMPLETE ==="
-    echo "Run with --live flag to execute commands with confirmation"
-else
-    echo "=== DEPLOYMENT COMPLETE ==="
-    echo "- Image ID: $IMAGE_ID"
-    echo "- New template version: $NEW_VERSION"
-    echo "- Default version: $DEFAULT_VERSION"
-fi
+    ensure_default_version_unchanged
+    aws_cli ec2 modify-launch-template \
+        --launch-template-id "$LAUNCH_TEMPLATE_ID" \
+        --default-version "$NEW_VERSION" \
+        --output json >/dev/null || die "Unable to set launch template version $NEW_VERSION as default."
+
+    current_default=$(read_current_default_version) || die "Unable to verify the promoted default version."
+    [[ "$current_default" == "$NEW_VERSION" ]] || \
+        die "Default version verification failed: expected $NEW_VERSION, got $current_default."
+
+    DEFAULT_UPDATED=true
+    printf 'Default launch template version is now %s.\n' "$NEW_VERSION"
+}
+
+print_completion_summary() {
+    printf '\n=== IMAGE PROMOTION COMPLETE ===\n'
+    printf 'AMI: %s (%s)\n' "$IMAGE_ID" "$IMAGE_NAME"
+    printf 'New launch template version: %s\n' "$NEW_VERSION"
+    if [[ "$DEFAULT_UPDATED" == "true" ]]; then
+        printf 'Default launch template version: %s\n' "$NEW_VERSION"
+        printf 'Future Auto Scaling launches will use the new AMI.\n'
+    else
+        printf 'Default launch template version: %s (unchanged)\n' "$DEFAULT_VERSION"
+        printf 'Future Auto Scaling launches will continue using the previous AMI.\n'
+    fi
+    printf 'Existing Auto Scaling instances were not replaced or refreshed.\n'
+}
+
+main() {
+    parse_arguments "$@"
+    check_requirements
+    verify_account_and_template
+    fetch_source_template_data
+    select_instance
+    validate_source_instance
+    find_pending_image
+
+    if [[ "$LIVE_MODE" != "true" ]]; then
+        preview_change
+        return
+    fi
+
+    if [[ -z "$IMAGE_ID" ]]; then
+        create_image
+    fi
+    wait_for_image
+    validate_available_image
+    create_and_verify_template_version
+    offer_default_promotion
+    print_completion_summary
+}
+
+main "$@"
