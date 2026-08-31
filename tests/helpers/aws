@@ -1,0 +1,372 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+readonly TEST_ACCOUNT_ID="450153405013"
+readonly TEST_INSTANCE_ID="i-00000000000000001"
+readonly OTHER_INSTANCE_ID="i-00000000000000002"
+readonly OLD_IMAGE_ID="ami-00000000000000001"
+readonly NEW_IMAGE_ID="ami-00000000000000002"
+readonly PENDING_IMAGE_ID="ami-00000000000000003"
+readonly OLD_SNAPSHOT_ID="snap-00000000000000001"
+readonly NEW_SNAPSHOT_ID="snap-00000000000000002"
+
+[[ -n "${MOCK_AWS_LOG:-}" ]] || {
+    printf 'MOCK_AWS_LOG is required.\n' >&2
+    exit 2
+}
+[[ -n "${MOCK_STATE_DIR:-}" ]] || {
+    printf 'MOCK_STATE_DIR is required.\n' >&2
+    exit 2
+}
+
+printf '%s\t' "$@" >> "$MOCK_AWS_LOG"
+printf '\n' >> "$MOCK_AWS_LOG"
+
+profile=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --profile)
+            profile="$2"
+            shift 2
+            ;;
+        --region)
+            shift 2
+            ;;
+        --no-cli-pager)
+            shift
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+[[ -n "$profile" ]] || {
+    printf 'Mock AWS call omitted --profile.\n' >&2
+    exit 2
+}
+[[ $# -ge 2 ]] || {
+    printf 'Mock AWS call has no service and operation.\n' >&2
+    exit 2
+}
+
+service="$1"
+operation="$2"
+shift 2
+
+option_value() {
+    local wanted="$1"
+    shift
+
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "$wanted" ]]; then
+            printf '%s\n' "$2"
+            return
+        fi
+        shift
+    done
+
+    return 1
+}
+
+require_writes_enabled() {
+    [[ "${MOCK_ALLOW_WRITES:-false}" == "true" ]] || {
+        printf 'Unexpected mutating AWS call: %s %s\n' "$service" "$operation" >&2
+        exit 90
+    }
+}
+
+current_default_version() {
+    if [[ -f "$MOCK_STATE_DIR/default-version" ]]; then
+        sed -n '1p' "$MOCK_STATE_DIR/default-version"
+    else
+        printf '24\n'
+    fi
+}
+
+template_data() {
+    local image_id="$1"
+    local mode="$2"
+
+    jq -cn \
+        --arg image_id "$image_id" \
+        --arg old_snapshot "$OLD_SNAPSHOT_ID" \
+        --arg mode "$mode" '
+        {
+            IamInstanceProfile: {
+                Arn: "arn:aws:iam::450153405013:instance-profile/MillstreamAppServerRole"
+            },
+            NetworkInterfaces: [
+                {
+                    DeviceIndex: 0,
+                    Groups: ["sg-00000000000000001", "sg-00000000000000002"]
+                }
+            ],
+            ImageId: $image_id,
+            InstanceType: "c3.large",
+            KeyName: "webmaster-au",
+            UserData: "dGVzdA=="
+        }
+        | if $mode == "unsafe" then
+            .Placement = {
+                AvailabilityZone: "ap-southeast-2b",
+                AvailabilityZoneId: "apse2-az1"
+            }
+            | .NetworkInterfaces[0].SubnetId = "subnet-00000000000000001"
+            | .NetworkInterfaces[0].PrivateIpAddresses = [
+                {Primary: true, PrivateIpAddress: "10.0.0.10"}
+            ]
+            | .BlockDeviceMappings = [
+                {
+                    DeviceName: "/dev/sda1",
+                    Ebs: {SnapshotId: $old_snapshot, VolumeType: "gp2"}
+                }
+            ]
+        elif $mode == "extra" then
+            .MetadataOptions = {HttpTokens: "optional"}
+        else
+            .
+        end
+    '
+}
+
+image_data() {
+    local image_id="$1"
+    local snapshot_id="$2"
+    local source_instance_id="$3"
+    local state="$4"
+
+    jq -cn \
+        --arg image_id "$image_id" \
+        --arg snapshot_id "$snapshot_id" \
+        --arg source_instance_id "$source_instance_id" \
+        --arg state "$state" '
+        {
+            ImageId: $image_id,
+            Name: "Millstream-App-Server-test",
+            State: $state,
+            SourceInstanceId: $source_instance_id,
+            Architecture: "x86_64",
+            VirtualizationType: "paravirtual",
+            RootDeviceName: "/dev/sda1",
+            BlockDeviceMappings: [
+                {
+                    DeviceName: "/dev/sda1",
+                    Ebs: {
+                        SnapshotId: $snapshot_id,
+                        VolumeType: "gp2",
+                        VolumeSize: 8,
+                        Encrypted: false,
+                        DeleteOnTermination: true
+                    }
+                }
+            ]
+        }
+    '
+}
+
+case "$service $operation" in
+    "sts get-caller-identity")
+        jq -cn --arg account "${MOCK_ACCOUNT_ID:-$TEST_ACCOUNT_ID}" '{Account: $account}'
+        ;;
+    "ec2 describe-launch-templates")
+        default_version=$(current_default_version)
+        latest_version=24
+        if [[ -f "$MOCK_STATE_DIR/version-created" ]]; then
+            latest_version=25
+        fi
+        jq -cn \
+            --argjson default_version "$default_version" \
+            --argjson latest_version "$latest_version" '
+            {
+                LaunchTemplates: [
+                    {
+                        LaunchTemplateId: "lt-04ceb7a70df074f2a",
+                        LaunchTemplateName: "Millstream-App-Server-Template",
+                        DefaultVersionNumber: $default_version,
+                        LatestVersionNumber: $latest_version
+                    }
+                ]
+            }
+        '
+        ;;
+    "ec2 describe-launch-template-versions")
+        version=$(option_value --versions "$@")
+        if [[ "$version" == "24" ]]; then
+            data=$(template_data "$OLD_IMAGE_ID" "${MOCK_SOURCE_TEMPLATE_MODE:-clean}")
+        elif [[ "$version" == "25" ]]; then
+            created_image_id="$NEW_IMAGE_ID"
+            if [[ -f "$MOCK_STATE_DIR/version-image-id" ]]; then
+                created_image_id=$(sed -n '1p' "$MOCK_STATE_DIR/version-image-id")
+            fi
+            data=$(template_data "$created_image_id" "${MOCK_NEW_TEMPLATE_MODE:-clean}")
+        else
+            printf 'Unexpected launch template version: %s\n' "$version" >&2
+            exit 2
+        fi
+        jq -cn --argjson version "$version" --argjson data "$data" '
+            {LaunchTemplateVersions: [{VersionNumber: $version, LaunchTemplateData: $data}]}
+        '
+        ;;
+    "ec2 describe-images")
+        if option_value --image-ids "$@" >/dev/null 2>&1; then
+            image_id=$(option_value --image-ids "$@")
+            case "$image_id" in
+                "$OLD_IMAGE_ID")
+                    data=$(image_data "$OLD_IMAGE_ID" "$OLD_SNAPSHOT_ID" "$OTHER_INSTANCE_ID" "available")
+                    ;;
+                "$NEW_IMAGE_ID"|"$PENDING_IMAGE_ID")
+                    data=$(image_data "$image_id" "$NEW_SNAPSHOT_ID" "$TEST_INSTANCE_ID" "available")
+                    ;;
+                *)
+                    printf '{"Images":[]}\n'
+                    exit 0
+                    ;;
+            esac
+            jq -cn --argjson data "$data" '{Images: [$data]}'
+        else
+            case "${MOCK_PENDING_IMAGES:-none}" in
+                none)
+                    printf '{"Images":[]}\n'
+                    ;;
+                one)
+                    jq -cn \
+                        --arg image_id "$PENDING_IMAGE_ID" \
+                        --arg source_instance_id "$TEST_INSTANCE_ID" '
+                        {
+                            Images: [
+                                {
+                                    ImageId: $image_id,
+                                    Name: "Millstream-App-Server-pending",
+                                    State: "pending",
+                                    SourceInstanceId: $source_instance_id,
+                                    CreationDate: "2026-08-31T00:00:00Z"
+                                }
+                            ]
+                        }
+                    '
+                    ;;
+                multiple)
+                    jq -cn --arg source_instance_id "$TEST_INSTANCE_ID" '
+                        {
+                            Images: [
+                                {
+                                    ImageId: "ami-00000000000000003",
+                                    Name: "Millstream-App-Server-pending-1",
+                                    State: "pending",
+                                    SourceInstanceId: $source_instance_id,
+                                    CreationDate: "2026-08-31T00:00:00Z"
+                                },
+                                {
+                                    ImageId: "ami-00000000000000004",
+                                    Name: "Millstream-App-Server-pending-2",
+                                    State: "pending",
+                                    SourceInstanceId: $source_instance_id,
+                                    CreationDate: "2026-08-31T00:01:00Z"
+                                }
+                            ]
+                        }
+                    '
+                    ;;
+                *)
+                    printf 'Unknown MOCK_PENDING_IMAGES value.\n' >&2
+                    exit 2
+                    ;;
+            esac
+        fi
+        ;;
+    "ec2 describe-instances")
+        jq -cn --arg instance_id "$TEST_INSTANCE_ID" '
+            {
+                Reservations: [
+                    {
+                        Instances: [
+                            {
+                                InstanceId: $instance_id,
+                                InstanceType: "c3.large",
+                                ImageId: "ami-00000000000000001",
+                                State: {Name: "running"},
+                                Architecture: "x86_64",
+                                VirtualizationType: "paravirtual",
+                                Placement: {AvailabilityZone: "ap-southeast-2b"},
+                                Tags: [
+                                    {Key: "Name", Value: "test-source"},
+                                    {
+                                        Key: "aws:autoscaling:groupName",
+                                        Value: "Millstream-Production-Auto-Scaling-Group"
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            }
+        '
+        ;;
+    "ec2 describe-instance-types")
+        jq -cn '
+            {
+                InstanceTypes: [
+                    {
+                        InstanceType: "c3.large",
+                        CurrentGeneration: false,
+                        ProcessorInfo: {SupportedArchitectures: ["i386", "x86_64"]},
+                        SupportedVirtualizationTypes: ["hvm", "paravirtual"]
+                    }
+                ]
+            }
+        '
+        ;;
+    "autoscaling describe-auto-scaling-groups")
+        jq -cn \
+            --arg selected "$TEST_INSTANCE_ID" \
+            --arg selected_health "${MOCK_SELECTED_INSTANCE_HEALTH:-Healthy}" \
+            --arg other "$OTHER_INSTANCE_ID" '
+            {
+                AutoScalingGroups: [
+                    {
+                        AutoScalingGroupName: "Millstream-Production-Auto-Scaling-Group",
+                        DesiredCapacity: 2,
+                        Instances: [
+                            {
+                                InstanceId: $selected,
+                                HealthStatus: $selected_health,
+                                LifecycleState: "InService"
+                            },
+                            {
+                                InstanceId: $other,
+                                HealthStatus: "Healthy",
+                                LifecycleState: "InService"
+                            }
+                        ]
+                    }
+                ]
+            }
+        '
+        ;;
+    "ec2 create-image")
+        require_writes_enabled
+        jq -cn --arg image_id "$NEW_IMAGE_ID" '{ImageId: $image_id}'
+        ;;
+    "ec2 create-launch-template-version")
+        require_writes_enabled
+        launch_template_data=$(option_value --launch-template-data "$@")
+        created_image_id=$(printf '%s\n' "$launch_template_data" | jq -er '.ImageId')
+        printf '%s\n' "$created_image_id" > "$MOCK_STATE_DIR/version-image-id"
+        printf 'created\n' > "$MOCK_STATE_DIR/version-created"
+        jq -cn '{LaunchTemplateVersion: {VersionNumber: 25}}'
+        ;;
+    "ec2 modify-launch-template")
+        require_writes_enabled
+        version=$(option_value --default-version "$@")
+        printf '%s\n' "$version" > "$MOCK_STATE_DIR/default-version"
+        jq -cn --argjson version "$version" '
+            {LaunchTemplate: {DefaultVersionNumber: $version}}
+        '
+        ;;
+    *)
+        printf 'Unexpected mock AWS operation: %s %s\n' "$service" "$operation" >&2
+        exit 2
+        ;;
+esac
