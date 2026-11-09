@@ -3,13 +3,15 @@
 set -Eeuo pipefail
 
 readonly REGION="ap-southeast-2"
-readonly LAUNCH_TEMPLATE_ID="lt-04ceb7a70df074f2a"
-readonly EXPECTED_LAUNCH_TEMPLATE_NAME="Millstream-App-Server-Template"
+readonly LAUNCH_TEMPLATE_ID="lt-03b872bbf73f81b5f"
+readonly EXPECTED_LAUNCH_TEMPLATE_NAME="Millstream-Production-V2026"
 readonly EXPECTED_AWS_ACCOUNT_ID="450153405013"
 readonly DEFAULT_READ_AWS_PROFILE_NAME="millstream-readonly"
-readonly DEFAULT_WRITE_AWS_PROFILE_NAME="millstream-readwrite"
-readonly AUTO_SCALING_GROUP_NAME="Millstream-Production-Auto-Scaling-Group"
-readonly IMAGE_NAME_PREFIX="Millstream-App-Server-"
+readonly DEFAULT_WRITE_AWS_PROFILE_NAME="millstream-admin"
+readonly AUTO_SCALING_GROUP_NAME="Millstream-Production-V2026"
+readonly EXPECTED_INSTANCE_PROFILE="arn:aws:iam::450153405013:instance-profile/MillstreamProductionV2026Role"
+readonly EXPECTED_VPC_ID="vpc-03322748c5824b11f"
+readonly IMAGE_NAME_PREFIX="millstream-production-v2026-"
 
 LIVE_MODE=false
 INSTANCE_ID=""
@@ -19,6 +21,8 @@ AMI_POLL_INTERVAL_SECONDS="${AMI_POLL_INTERVAL_SECONDS:-15}"
 
 ACCOUNT_ID=""
 DEFAULT_VERSION=""
+SOURCE_VERSION=""
+SOURCE_ASG_SELECTION=""
 LATEST_VERSION=""
 SOURCE_TEMPLATE_DATA=""
 SOURCE_TEMPLATE_IMAGE_ID=""
@@ -35,6 +39,8 @@ IMAGE_NAME=""
 IMAGE_DATA=""
 NEW_VERSION=""
 DEFAULT_UPDATED=false
+ASG_UPDATED=false
+PROMOTION_STARTED=false
 
 usage() {
     cat <<EOF
@@ -55,6 +61,13 @@ EOF
 
 die() {
     printf 'ERROR: %s\n' "$*" >&2
+    if [[ "$PROMOTION_STARTED" == "true" ]]; then
+        printf 'Promotion was attempted. Inspect %s and template %s before retrying; no automatic rollback was attempted.\n' \
+            "$AUTO_SCALING_GROUP_NAME" "$LAUNCH_TEMPLATE_ID" >&2
+        if [[ "$ASG_UPDATED" == "true" ]]; then
+            printf 'Auto Scaling was verified on version %s before this failure.\n' "$NEW_VERSION" >&2
+        fi
+    fi
     exit 1
 }
 
@@ -201,6 +214,52 @@ verify_account_and_template() {
     printf '  Default version: %s; latest version: %s\n' "$DEFAULT_VERSION" "$LATEST_VERSION"
 }
 
+# The group pins a numeric version; its selection, not the template default,
+# is authoritative for future production launches.
+read_production_group() {
+    local response=""
+    response=$(aws_cli autoscaling describe-auto-scaling-groups \
+        --auto-scaling-group-names "$AUTO_SCALING_GROUP_NAME" \
+        --output json) || die "Unable to inspect Auto Scaling Group $AUTO_SCALING_GROUP_NAME."
+    printf '%s\n' "$response" | jq -ce \
+        --arg name "$AUTO_SCALING_GROUP_NAME" --arg template "$LAUNCH_TEMPLATE_ID" '
+        select((.AutoScalingGroups | length) == 1)
+        | .AutoScalingGroups[0]
+        | select(.AutoScalingGroupName == $name
+            and .MixedInstancesPolicy == null
+            and .LaunchConfigurationName == null
+            and .LaunchTemplate.LaunchTemplateId == $template
+            and (.LaunchTemplate.Version | type) == "string"
+            and (.LaunchTemplate.Version | test("^[1-9][0-9]*$"))
+            and (.VPCZoneIdentifier | type) == "string"
+            and (.VPCZoneIdentifier | length) > 0)
+    ' || die "Expected $AUTO_SCALING_GROUP_NAME to pin a numeric version of $LAUNCH_TEMPLATE_ID with existing subnets."
+}
+
+asg_selection() {
+    jq -cS '{template_id: .LaunchTemplate.LaunchTemplateId,
+        version: .LaunchTemplate.Version,
+        subnets: (.VPCZoneIdentifier | split(",") | sort)}'
+}
+
+verify_production_group() {
+    local group=""
+    group=$(read_production_group) || die "Production Auto Scaling configuration is not supported."
+    SOURCE_ASG_SELECTION=$(printf '%s\n' "$group" | asg_selection) || die "Unable to read production launch selection."
+    SOURCE_VERSION=$(printf '%s\n' "$group" | jq -er '.LaunchTemplate.Version') || die "Production version is missing."
+    printf '  Auto Scaling Group: %s; pinned version: %s\n' "$AUTO_SCALING_GROUP_NAME" "$SOURCE_VERSION"
+}
+
+ensure_launch_selection_unchanged() {
+    local group=""
+    local selection=""
+    ensure_default_version_unchanged
+    group=$(read_production_group) || die "Unable to recheck production before changing launch settings."
+    selection=$(printf '%s\n' "$group" | asg_selection) || die "Unable to recheck production launch selection."
+    [[ "$selection" == "$SOURCE_ASG_SELECTION" ]] || \
+        die "Production launch selection or subnets changed during this run; refusing to overwrite them."
+}
+
 fetch_image_data() {
     local image_id="$1"
     local response=""
@@ -280,28 +339,28 @@ fetch_source_template_data() {
 
     version_json=$(aws_cli ec2 describe-launch-template-versions \
         --launch-template-id "$LAUNCH_TEMPLATE_ID" \
-        --versions "$DEFAULT_VERSION" \
-        --output json) || die "Unable to read launch template version $DEFAULT_VERSION."
+        --versions "$SOURCE_VERSION" \
+        --output json) || die "Unable to read launch template version $SOURCE_VERSION."
 
     version_count=$(printf '%s\n' "$version_json" | jq -er '.LaunchTemplateVersions | length') || \
         die "Invalid launch template version response."
     [[ "$version_count" -eq 1 ]] || \
-        die "Expected one launch template version for $DEFAULT_VERSION; found $version_count."
+        die "Expected one launch template version for $SOURCE_VERSION; found $version_count."
 
     SOURCE_TEMPLATE_DATA=$(printf '%s\n' "$version_json" | \
         jq -cer '.LaunchTemplateVersions[0].LaunchTemplateData') || \
-        die "Launch template version $DEFAULT_VERSION has no template data."
+        die "Launch template version $SOURCE_VERSION has no template data."
     SOURCE_TEMPLATE_IMAGE_ID=$(printf '%s\n' "$SOURCE_TEMPLATE_DATA" | jq -er '.ImageId') || \
-        die "Launch template version $DEFAULT_VERSION has no AMI."
+        die "Launch template version $SOURCE_VERSION has no AMI."
     SOURCE_TEMPLATE_INSTANCE_TYPE=$(printf '%s\n' "$SOURCE_TEMPLATE_DATA" | jq -er '.InstanceType') || \
-        die "Launch template version $DEFAULT_VERSION has no instance type."
+        die "Launch template version $SOURCE_VERSION has no instance type."
 
     validate_image_id "$SOURCE_TEMPLATE_IMAGE_ID"
     source_image_data=$(fetch_image_data "$SOURCE_TEMPLATE_IMAGE_ID")
     SOURCE_TEMPLATE_ROOT_DEVICE=$(printf '%s\n' "$source_image_data" | jq -er '.RootDeviceName') || \
         die "Unable to determine the root device for AMI $SOURCE_TEMPLATE_IMAGE_ID."
 
-    validate_template_safety "current default template version $DEFAULT_VERSION" \
+    validate_template_safety "production-selected template version $SOURCE_VERSION" \
         "$SOURCE_TEMPLATE_DATA" "$SOURCE_TEMPLATE_ROOT_DEVICE"
 }
 
@@ -315,9 +374,11 @@ select_instance() {
         return
     fi
 
-    printf 'Fetching running and stopped EC2 instances...\n'
+    printf 'Fetching modern production image sources (running or stopped)...\n'
     instances_json=$(aws_cli ec2 describe-instances \
         --filters "Name=instance-state-name,Values=running,stopped" \
+            "Name=iam-instance-profile.arn,Values=$EXPECTED_INSTANCE_PROFILE" \
+            "Name=vpc-id,Values=$EXPECTED_VPC_ID" \
         --output json) || die "Unable to list EC2 instances."
 
     choices=$(printf '%s\n' "$instances_json" | jq -r '
@@ -332,7 +393,7 @@ select_instance() {
         ]
         | @tsv
     ') || die "Unable to format EC2 instance choices."
-    [[ -n "$choices" ]] || die "No running or stopped instances were found in $REGION."
+    [[ -n "$choices" ]] || die "No modern production image sources were found in $REGION."
 
     if ! selection=$(printf '%s\n' "$choices" | fzf \
         --delimiter=$'\t' \
@@ -370,6 +431,13 @@ validate_source_instance() {
         die "Instance $INSTANCE_ID has no state."
     [[ "$SOURCE_INSTANCE_STATE" == "running" || "$SOURCE_INSTANCE_STATE" == "stopped" ]] || \
         die "Instance $INSTANCE_ID must be running or stopped; it is $SOURCE_INSTANCE_STATE."
+
+    if ! printf '%s\n' "$SOURCE_INSTANCE_DATA" | jq -e \
+        --arg profile "$EXPECTED_INSTANCE_PROFILE" --arg vpc "$EXPECTED_VPC_ID" '
+        .IamInstanceProfile.Arn == $profile and .VpcId == $vpc
+    ' >/dev/null; then
+        die "Source instance must use the modern production instance profile and VPC; legacy and development sources are not supported."
+    fi
 
     SOURCE_INSTANCE_NAME=$(printf '%s\n' "$SOURCE_INSTANCE_DATA" | \
         jq -r '[.Tags[]? | select(.Key == "Name") | .Value][0] // "unnamed"')
@@ -416,6 +484,8 @@ validate_source_instance() {
         warn "$SOURCE_TEMPLATE_INSTANCE_TYPE is a previous-generation instance type. This script preserves it; modernization requires a separately tested HVM-compatible AMI and template change."
     fi
 
+    [[ "$SOURCE_INSTANCE_ASG" == "$AUTO_SCALING_GROUP_NAME" || "$SOURCE_INSTANCE_ASG" == "unmanaged" ]] || \
+        die "Source belongs to another Auto Scaling Group: $SOURCE_INSTANCE_ASG."
     if [[ "$SOURCE_INSTANCE_ASG" != "$AUTO_SCALING_GROUP_NAME" ]]; then
         warn "The selected instance is not a member of $AUTO_SCALING_GROUP_NAME. Confirm that it is the intended image source before using live mode."
         return
@@ -491,10 +561,11 @@ preview_change() {
     fi
 
     printf '\n=== READ-ONLY PREVIEW ===\n'
-    printf 'Source launch template version: %s\n' "$DEFAULT_VERSION"
+    printf 'Source launch template version: %s\n' "$SOURCE_VERSION"
     printf 'Configuration change allowed:\n'
     printf '  ImageId: %s -> %s\n' "$SOURCE_TEMPLATE_IMAGE_ID" "$preview_image_id"
-    printf 'All other launch template fields will be inherited from version %s and verified unchanged.\n' "$DEFAULT_VERSION"
+    printf 'All other launch template fields will be inherited from version %s and verified unchanged.\n' "$SOURCE_VERSION"
+    printf 'Promotion will select the new numeric version on %s, then make it the template default.\n' "$AUTO_SCALING_GROUP_NAME"
     printf 'No AWS resources were changed. Run with --live to create and promote the AMI.\n'
 }
 
@@ -630,7 +701,7 @@ ensure_default_version_unchanged() {
 
     current_default=$(read_current_default_version) || die "Unable to determine the current default version."
     [[ "$current_default" == "$DEFAULT_VERSION" ]] || \
-        die "Launch template default changed from $DEFAULT_VERSION to $current_default during this run. AMI $IMAGE_ID was retained, but no template change was made."
+        die "Launch template default changed from $DEFAULT_VERSION to $current_default during this run. AMI $IMAGE_ID was retained, but this step was refused."
 }
 
 create_and_verify_template_version() {
@@ -653,17 +724,17 @@ create_and_verify_template_version() {
     validate_template_safety "prospective launch template version" \
         "$expected_data" "$SOURCE_TEMPLATE_ROOT_DEVICE"
 
-    printf '\nThe new template version will inherit version %s and change only:\n' "$DEFAULT_VERSION"
+    printf '\nThe new template version will inherit version %s and change only:\n' "$SOURCE_VERSION"
     printf '  ImageId: %s -> %s\n' "$SOURCE_TEMPLATE_IMAGE_ID" "$IMAGE_ID"
     confirm "Create this launch template version" || die "Launch template version creation cancelled. AMI $IMAGE_ID was retained."
 
-    ensure_default_version_unchanged
+    ensure_launch_selection_unchanged
 
     version_description="AMI $IMAGE_ID from $INSTANCE_ID"
-    client_token="createlaunchinstance-${LAUNCH_TEMPLATE_ID}-${DEFAULT_VERSION}-${IMAGE_ID}"
+    client_token="createlaunchinstance-${LAUNCH_TEMPLATE_ID}-${SOURCE_VERSION}-${IMAGE_ID}"
     create_output=$(aws_cli ec2 create-launch-template-version \
         --launch-template-id "$LAUNCH_TEMPLATE_ID" \
-        --source-version "$DEFAULT_VERSION" \
+        --source-version "$SOURCE_VERSION" \
         --version-description "$version_description" \
         --client-token "$client_token" \
         --launch-template-data "$override_data" \
@@ -698,25 +769,43 @@ create_and_verify_template_version() {
     printf 'Verified launch template version %s: only ImageId changed.\n' "$NEW_VERSION"
 }
 
-offer_default_promotion() {
+offer_production_promotion() {
+    local group=""
+    local selection=""
+    local expected_selection=""
     local current_default=""
 
-    if ! confirm "Set launch template version $NEW_VERSION as the default"; then
-        printf 'Version %s was created but not promoted. Default remains version %s.\n' \
-            "$NEW_VERSION" "$DEFAULT_VERSION"
+    if ! confirm "Use version $NEW_VERSION for future $AUTO_SCALING_GROUP_NAME launches and make it the template default"; then
+        printf 'Version %s was created but not promoted. Production remains on version %s.\n' \
+            "$NEW_VERSION" "$SOURCE_VERSION"
         return
     fi
 
+    ensure_launch_selection_unchanged
+    expected_selection=$(printf '%s\n' "$SOURCE_ASG_SELECTION" | \
+        jq -cS --arg version "$NEW_VERSION" '.version = $version') || die "Unable to prepare production selection."
+    PROMOTION_STARTED=true
+    aws_cli autoscaling update-auto-scaling-group \
+        --auto-scaling-group-name "$AUTO_SCALING_GROUP_NAME" \
+        --launch-template "LaunchTemplateId=$LAUNCH_TEMPLATE_ID,Version=$NEW_VERSION" \
+        --output json || die "Auto Scaling update failed; the template default was not changed. Verify the group's actual state."
+    group=$(read_production_group) || die "Unable to verify production after updating its version; the default was not changed."
+    selection=$(printf '%s\n' "$group" | asg_selection) || die "Unable to verify the production launch selection."
+    [[ "$selection" == "$expected_selection" ]] || \
+        die "Production selection verification failed; the template default was not changed."
+    ASG_UPDATED=true
+    printf 'Production Auto Scaling now selects numeric version %s.\n' "$NEW_VERSION"
+
+    # This is a separate AWS write: if it fails, leave the verified ASG selection
+    # in place and report the partial promotion rather than overwriting a race.
     ensure_default_version_unchanged
     aws_cli ec2 modify-launch-template \
         --launch-template-id "$LAUNCH_TEMPLATE_ID" \
         --default-version "$NEW_VERSION" \
-        --output json >/dev/null || die "Unable to set launch template version $NEW_VERSION as default."
-
+        --output json >/dev/null || die "Auto Scaling uses $NEW_VERSION, but updating the template default failed."
     current_default=$(read_current_default_version) || die "Unable to verify the promoted default version."
     [[ "$current_default" == "$NEW_VERSION" ]] || \
         die "Default version verification failed: expected $NEW_VERSION, got $current_default."
-
     DEFAULT_UPDATED=true
     printf 'Default launch template version is now %s.\n' "$NEW_VERSION"
 }
@@ -725,10 +814,12 @@ print_completion_summary() {
     printf '\n=== IMAGE PROMOTION COMPLETE ===\n'
     printf 'AMI: %s (%s)\n' "$IMAGE_ID" "$IMAGE_NAME"
     printf 'New launch template version: %s\n' "$NEW_VERSION"
-    if [[ "$DEFAULT_UPDATED" == "true" ]]; then
+    if [[ "$ASG_UPDATED" == "true" && "$DEFAULT_UPDATED" == "true" ]]; then
+        printf 'Production Auto Scaling version: %s\n' "$NEW_VERSION"
         printf 'Default launch template version: %s\n' "$NEW_VERSION"
         printf 'Future Auto Scaling launches will use the new AMI.\n'
     else
+        printf 'Production Auto Scaling version: %s (unchanged)\n' "$SOURCE_VERSION"
         printf 'Default launch template version: %s (unchanged)\n' "$DEFAULT_VERSION"
         printf 'Future Auto Scaling launches will continue using the previous AMI.\n'
     fi
@@ -739,6 +830,7 @@ main() {
     parse_arguments "$@"
     check_requirements
     verify_account_and_template
+    verify_production_group
     fetch_source_template_data
     select_instance
     validate_source_instance
@@ -755,7 +847,7 @@ main() {
     wait_for_image
     validate_available_image
     create_and_verify_template_version
-    offer_default_promotion
+    offer_production_promotion
     print_completion_summary
 }
 
