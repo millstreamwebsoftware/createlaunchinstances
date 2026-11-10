@@ -81,7 +81,7 @@ current_default_version() {
     if [[ -f "$MOCK_STATE_DIR/default-version" ]]; then
         sed -n '1p' "$MOCK_STATE_DIR/default-version"
     else
-        printf '24\n'
+        printf '%s\n' "${MOCK_DEFAULT_VERSION:-24}"
     fi
 }
 
@@ -95,17 +95,20 @@ template_data() {
         --arg mode "$mode" '
         {
             IamInstanceProfile: {
-                Arn: "arn:aws:iam::450153405013:instance-profile/MillstreamAppServerRole"
+                Arn: "arn:aws:iam::450153405013:instance-profile/MillstreamProductionV2026Role"
             },
             NetworkInterfaces: [
                 {
                     DeviceIndex: 0,
+                    AssociatePublicIpAddress: true,
                     Groups: ["sg-00000000000000001", "sg-00000000000000002"]
                 }
             ],
             ImageId: $image_id,
-            InstanceType: "c3.large",
+            InstanceType: "t3a.medium",
             KeyName: "webmaster-au",
+            MetadataOptions: {HttpTokens: "required", HttpEndpoint: "enabled"},
+            BlockDeviceMappings: [{DeviceName: "/dev/xvda", Ebs: {VolumeType: "gp3", VolumeSize: 20, Encrypted: true, DeleteOnTermination: true}}],
             UserData: "dGVzdA=="
         }
         | if $mode == "unsafe" then
@@ -119,12 +122,14 @@ template_data() {
             ]
             | .BlockDeviceMappings = [
                 {
-                    DeviceName: "/dev/sda1",
-                    Ebs: {SnapshotId: $old_snapshot, VolumeType: "gp2"}
+                    DeviceName: "/dev/xvda",
+                    Ebs: {SnapshotId: $old_snapshot, VolumeType: "gp3"}
                 }
             ]
         elif $mode == "extra" then
             .MetadataOptions = {HttpTokens: "optional"}
+        elif $mode == "no-public-ip" then
+            .NetworkInterfaces[0].AssociatePublicIpAddress = false
         else
             .
         end
@@ -144,20 +149,20 @@ image_data() {
         --arg state "$state" '
         {
             ImageId: $image_id,
-            Name: "Millstream-App-Server-test",
+            Name: "millstream-production-v2026-test",
             State: $state,
             SourceInstanceId: $source_instance_id,
             Architecture: "x86_64",
-            VirtualizationType: "paravirtual",
-            RootDeviceName: "/dev/sda1",
+            VirtualizationType: "hvm",
+            RootDeviceName: "/dev/xvda",
             BlockDeviceMappings: [
                 {
-                    DeviceName: "/dev/sda1",
+                    DeviceName: "/dev/xvda",
                     Ebs: {
                         SnapshotId: $snapshot_id,
-                        VolumeType: "gp2",
-                        VolumeSize: 8,
-                        Encrypted: false,
+                        VolumeType: "gp3",
+                        VolumeSize: 20,
+                        Encrypted: true,
                         DeleteOnTermination: true
                     }
                 }
@@ -182,8 +187,8 @@ case "$service $operation" in
             {
                 LaunchTemplates: [
                     {
-                        LaunchTemplateId: "lt-04ceb7a70df074f2a",
-                        LaunchTemplateName: "Millstream-App-Server-Template",
+                        LaunchTemplateId: "lt-03b872bbf73f81b5f",
+                        LaunchTemplateName: "Millstream-Production-V2026",
                         DefaultVersionNumber: $default_version,
                         LatestVersionNumber: $latest_version
                     }
@@ -238,7 +243,7 @@ case "$service $operation" in
                             Images: [
                                 {
                                     ImageId: $image_id,
-                                    Name: "Millstream-App-Server-pending",
+                                    Name: "millstream-production-v2026-pending",
                                     State: "pending",
                                     SourceInstanceId: $source_instance_id,
                                     CreationDate: "2026-08-31T00:00:00Z"
@@ -253,14 +258,14 @@ case "$service $operation" in
                             Images: [
                                 {
                                     ImageId: "ami-00000000000000003",
-                                    Name: "Millstream-App-Server-pending-1",
+                                    Name: "millstream-production-v2026-pending-1",
                                     State: "pending",
                                     SourceInstanceId: $source_instance_id,
                                     CreationDate: "2026-08-31T00:00:00Z"
                                 },
                                 {
                                     ImageId: "ami-00000000000000004",
-                                    Name: "Millstream-App-Server-pending-2",
+                                    Name: "millstream-production-v2026-pending-2",
                                     State: "pending",
                                     SourceInstanceId: $source_instance_id,
                                     CreationDate: "2026-08-31T00:01:00Z"
@@ -277,24 +282,28 @@ case "$service $operation" in
         fi
         ;;
     "ec2 describe-instances")
-        jq -cn --arg instance_id "$TEST_INSTANCE_ID" '
+        jq -cn --arg instance_id "$TEST_INSTANCE_ID" \
+            --arg instance_profile "${MOCK_INSTANCE_PROFILE:-MillstreamProductionV2026Role}" \
+            --arg source_asg "${MOCK_SOURCE_ASG:-Millstream-Production-V2026}" '
             {
                 Reservations: [
                     {
                         Instances: [
                             {
                                 InstanceId: $instance_id,
-                                InstanceType: "c3.large",
+                                InstanceType: "t3a.medium",
                                 ImageId: "ami-00000000000000001",
+                                VpcId: "vpc-03322748c5824b11f",
+                                IamInstanceProfile: {Arn: ("arn:aws:iam::450153405013:instance-profile/" + $instance_profile)},
                                 State: {Name: "running"},
                                 Architecture: "x86_64",
-                                VirtualizationType: "paravirtual",
+                                VirtualizationType: "hvm",
                                 Placement: {AvailabilityZone: "ap-southeast-2b"},
                                 Tags: [
                                     {Key: "Name", Value: "test-source"},
                                     {
                                         Key: "aws:autoscaling:groupName",
-                                        Value: "Millstream-Production-Auto-Scaling-Group"
+                                        Value: $source_asg
                                     }
                                 ]
                             }
@@ -309,41 +318,62 @@ case "$service $operation" in
             {
                 InstanceTypes: [
                     {
-                        InstanceType: "c3.large",
-                        CurrentGeneration: false,
-                        ProcessorInfo: {SupportedArchitectures: ["i386", "x86_64"]},
-                        SupportedVirtualizationTypes: ["hvm", "paravirtual"]
+                        InstanceType: "t3a.medium",
+                        CurrentGeneration: true,
+                        ProcessorInfo: {SupportedArchitectures: ["x86_64"]},
+                        SupportedVirtualizationTypes: ["hvm"]
                     }
                 ]
             }
         '
         ;;
     "autoscaling describe-auto-scaling-groups")
+        asg_version="${MOCK_ASG_VERSION:-24}"
+        if [[ -f "$MOCK_STATE_DIR/asg-version" ]]; then
+            asg_version=$(cat "$MOCK_STATE_DIR/asg-version")
+        fi
+        asg_subnets="subnet-0a7cad8ec1ef2b0a7,subnet-0fe146e137aa3bec2"
+        if [[ -f "$MOCK_STATE_DIR/version-created" && ! -f "$MOCK_STATE_DIR/asg-version" ]]; then
+            if [[ "${MOCK_CONCURRENT_ASG_VERSION:-false}" == true ]]; then asg_version=26; fi
+            if [[ "${MOCK_CONCURRENT_SUBNETS:-false}" == true ]]; then asg_subnets=other-subnet; fi
+        fi
         jq -cn \
             --arg selected "$TEST_INSTANCE_ID" \
             --arg selected_health "${MOCK_SELECTED_INSTANCE_HEALTH:-Healthy}" \
-            --arg other "$OTHER_INSTANCE_ID" '
+            --arg other "$OTHER_INSTANCE_ID" \
+            --arg version "$asg_version" \
+            --arg template "${MOCK_ASG_TEMPLATE:-lt-03b872bbf73f81b5f}" \
+            --arg subnets "$asg_subnets" \
+            --arg mixed "${MOCK_MIXED_POLICY:-false}" '
             {
                 AutoScalingGroups: [
                     {
-                        AutoScalingGroupName: "Millstream-Production-Auto-Scaling-Group",
-                        DesiredCapacity: 2,
+                        AutoScalingGroupName: "Millstream-Production-V2026",
+                        LaunchTemplate: {LaunchTemplateId: $template, LaunchTemplateName: "Millstream-Production-V2026", Version: $version},
+                        VPCZoneIdentifier: $subnets,
+                        MinSize: 2, MaxSize: 6, DesiredCapacity: 2,
                         Instances: [
-                            {
-                                InstanceId: $selected,
-                                HealthStatus: $selected_health,
-                                LifecycleState: "InService"
-                            },
-                            {
-                                InstanceId: $other,
-                                HealthStatus: "Healthy",
-                                LifecycleState: "InService"
-                            }
+                            {InstanceId: $selected, HealthStatus: $selected_health, LifecycleState: "InService"},
+                            {InstanceId: $other, HealthStatus: "Healthy", LifecycleState: "InService"}
                         ]
                     }
                 ]
             }
+            | if $mixed == "true" then .AutoScalingGroups[0].MixedInstancesPolicy = {} else . end
         '
+        ;;
+    "autoscaling update-auto-scaling-group")
+        require_writes_enabled
+        if [[ "${MOCK_ASG_UPDATE_FAILURE:-false}" == true ]]; then exit 91; fi
+        selection=$(option_value --launch-template "$@")
+        [[ "$selection" == 'LaunchTemplateId=lt-03b872bbf73f81b5f,Version=25' ]] || exit 92
+        if [[ "${MOCK_ASG_READBACK_MISMATCH:-false}" != true ]]; then
+            printf '25\n' > "$MOCK_STATE_DIR/asg-version"
+        fi
+        if [[ "${MOCK_CONCURRENT_DEFAULT_AFTER_ASG:-false}" == true ]]; then
+            printf '26\n' > "$MOCK_STATE_DIR/default-version"
+        fi
+        printf '{}\n'
         ;;
     "ec2 create-image")
         require_writes_enabled
@@ -355,10 +385,14 @@ case "$service $operation" in
         created_image_id=$(printf '%s\n' "$launch_template_data" | jq -er '.ImageId')
         printf '%s\n' "$created_image_id" > "$MOCK_STATE_DIR/version-image-id"
         printf 'created\n' > "$MOCK_STATE_DIR/version-created"
+        if [[ "${MOCK_CONCURRENT_DEFAULT:-false}" == true ]]; then
+            printf '26\n' > "$MOCK_STATE_DIR/default-version"
+        fi
         jq -cn '{LaunchTemplateVersion: {VersionNumber: 25}}'
         ;;
     "ec2 modify-launch-template")
         require_writes_enabled
+        if [[ "${MOCK_DEFAULT_UPDATE_FAILURE:-false}" == true ]]; then exit 93; fi
         version=$(option_value --default-version "$@")
         printf '%s\n' "$version" > "$MOCK_STATE_DIR/default-version"
         jq -cn --argjson version "$version" '
